@@ -1,0 +1,121 @@
+# REST API와 빈 Lambda 5개. POST와 GET만 API에 연결한다.
+# 아래 명령은 back 폴더에서 실행한다.
+# 빌드: sam build -t template.yaml
+# 배포: sam deploy -t .aws-sam/build/template.yaml --guided --config-file "$PWD/samconfig.toml"
+# trustlens 스택으로 배포한다. GitHub main 브랜치의 코드를 사용한다.
+AWSTemplateFormatVersion: '2010-09-09' # CloudFormation 문서 형식.
+Transform: AWS::Serverless-2016-10-31 # SAM 문법 사용.
+Description: TrustLens REST API and five Lambda entry points # 실제 로직은 담당자가 작성한다.
+
+Globals: # 다섯 Lambda에 공통으로 적용한다.
+  Function: # 공통 실행 환경.
+    Runtime: python3.12 # 모든 함수는 Python 3.12.
+    Handler: lambda.lambda_handler # 각 코드 폴더의 lambda.py 안 lambda_handler.
+    MemorySize: 128 # 메모리 128MB.
+    Timeout: 10 # 기본 실행 제한 10초. 실제 분석 구현 시 개별 조정한다.
+    Environment: # 담당자 코드가 사용할 환경변수.
+      Variables: # 실제 생성된 테이블 이름.
+        TABLE_NAME: !Ref trustlensTable # 실제 생성된 테이블 이름을 전달한다.
+        RETENTION_DAYS: '30' # 한 달을 30일로 정의. 저장 코드가 expiresAt 계산에 사용한다.
+
+Resources: # REST API 하나, Lambda 다섯 개, 공통 역할 하나, DB 하나.
+  DomRestApi: # REST API를 생성한다.
+    Type: AWS::Serverless::Api # 콘솔의 Resources/Methods 화면을 사용하는 API.
+    Properties: # API 기본 설정.
+      Name: !Sub '${AWS::StackName}-api' # 콘솔에 표시할 API 이름.
+      StageName: api # URL의 /api 접두사. dev/prod 분리가 아니다.
+      EndpointConfiguration: REGIONAL # 서울 리전 REST API.
+      OpenApiVersion: 3.0.1 # 별도의 기본 Stage 생성 없이 api 스테이지 사용.
+      # 확장 service worker가 host_permissions로 호출하므로 CORS는 추가하지 않는다.
+
+  LambdaExecutionRole: # 다섯 Lambda가 공통으로 사용할 IAM 실행 역할.
+    Type: AWS::IAM::Role # 실제 역할 이름은 CloudFormation이 생성한다.
+    Properties: # 신뢰 정책과 요청한 전체 접근 정책.
+      AssumeRolePolicyDocument: # Lambda 서비스만 이 역할을 사용한다.
+        Version: '2012-10-17' # IAM 정책 문서 버전.
+        Statement: # 역할을 사용할 주체 정의.
+          - Effect: Allow # Lambda의 역할 사용 허용.
+            Principal: {Service: lambda.amazonaws.com} # Lambda 서비스.
+            Action: sts:AssumeRole # 임시 실행 자격 증명 발급.
+      ManagedPolicyArns: # 사용자 요청대로 다섯 함수 모두 FullAccess 사용.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole' # 실행 로그.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonDynamoDBFullAccess' # DynamoDB 전체 접근.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonBedrockFullAccess' # 모델 미정 상태의 Bedrock 전체 접근.
+
+  SubmitFunction: # POST 접수 담당 Lambda를 생성한다.
+    Type: AWS::Serverless::Function # POST 담당 Lambda.
+    Properties: # 이 함수의 이름과 코드 위치.
+      FunctionName: !Sub '${AWS::StackName}-submit' # trustlens-submit.
+      CodeUri: lambda/submit/ # 이 폴더만 별도 패키지로 올린다.
+      Role: !GetAtt LambdaExecutionRole.Arn # DynamoDB와 Bedrock 전체 접근 역할.
+      Events: # API 요청과 Lambda 연결.
+        Submit: # POST 접수 경로.
+          Type: Api # REST API 이벤트.
+          Properties: # 연결 정보.
+            RestApiId: !Ref DomRestApi # 위 REST API 사용.
+            Path: /v1/reviews/analyze # 스테이지 포함 실제 URL은 /api/v1/reviews/analyze.
+            Method: POST # 접수 요청.
+
+  FetchFunction: # ID별 결과 조회용 Lambda.
+    Type: AWS::Serverless::Function # GET 담당 Lambda.
+    Properties: # 이름과 코드 위치.
+      FunctionName: !Sub '${AWS::StackName}-fetch' # trustlens-fetch.
+      CodeUri: lambda/fetch/ # 조회 담당 코드 폴더.
+      Role: !GetAtt LambdaExecutionRole.Arn # 동일한 전체 접근 역할.
+      Events: # GET만 연결한다.
+        FetchResult: # 조회 경로.
+          Type: Api # REST API 이벤트.
+          Properties: # 연결 정보.
+            RestApiId: !Ref DomRestApi # POST와 같은 API.
+            Path: /v1/reviews/analyze/{analysisId} # ID는 매 요청마다 바뀐다.
+            Method: GET # 상태와 결과 조회 요청.
+
+  PreprocessFunction: # 전처리용으로 준비만 한다.
+    Type: AWS::Serverless::Function # API에 연결하지 않는다.
+    Properties: # 이름과 코드 위치.
+      FunctionName: !Sub '${AWS::StackName}-preprocess' # trustlens-preprocess.
+      CodeUri: lambda/preprocess/ # 전처리 담당 코드 폴더.
+      Role: !GetAtt LambdaExecutionRole.Arn # 동일한 전체 접근 역할.
+
+  AnalyzeFunction: # Bedrock 분석용으로 준비만 한다.
+    Type: AWS::Serverless::Function # API에 연결하지 않는다.
+    Properties: # 이름과 코드 위치.
+      FunctionName: !Sub '${AWS::StackName}-analyze' # trustlens-analyze.
+      CodeUri: lambda/analyze/ # 분석 담당 코드 폴더.
+      Role: !GetAtt LambdaExecutionRole.Arn # 동일한 전체 접근 역할.
+
+  CombineFunction: # 결과 결합용으로 준비만 한다.
+    Type: AWS::Serverless::Function # API에 연결하지 않는다.
+    Properties: # 이름과 코드 위치.
+      FunctionName: !Sub '${AWS::StackName}-combine' # trustlens-combine.
+      CodeUri: lambda/combine/ # 결합 담당 코드 폴더.
+      Role: !GetAtt LambdaExecutionRole.Arn # 동일한 전체 접근 역할.
+
+  trustlensTable: # 요청 하나당 항목 하나를 저장한다.
+    Type: AWS::DynamoDB::Table # DynamoDB 테이블 생성.
+    DeletionPolicy: Retain # 스택을 삭제해도 저장 데이터는 남긴다.
+    UpdateReplacePolicy: Retain # 테이블 교체 시 기존 데이터도 남긴다.
+    Properties: # 테이블 설정.
+      TableName: !Sub '${AWS::StackName}-reviews' # trustlens-reviews.
+      BillingMode: PAY_PER_REQUEST # 사용량 기준 과금.
+      TimeToLiveSpecification: # 항목의 expiresAt 숫자(Unix 초)를 기준으로 자동 만료한다.
+        AttributeName: expiresAt # 저장 담당자가 각 항목에 저장해야 하는 만료 시각.
+        Enabled: true # TTL 활성화. 이 설정만으로 항목에 만료 시각이 자동 입력되지는 않는다.
+      AttributeDefinitions: # 파티션 키 정의. analysisId와 recordId의 매핑은 담당 코드에서 처리한다.
+        - AttributeName: recordId # 저장 요청의 고유 ID.
+          AttributeType: S # 문자열 ID.
+      KeySchema: # 조회 기준.
+        - AttributeName: recordId # UUID로 항목을 구분한다.
+          KeyType: HASH # 파티션 키.
+
+Outputs: # 배포 후 사용할 값.
+  SubmitUrl: # 확장 프로그램이 POST 요청을 보낼 주소.
+    Value: !Sub 'https://${DomRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/reviews/analyze' # POST URL.
+  ResultUrl: # {analysisId}를 접수 응답의 ID로 바꿔 GET한다.
+    Value: !Sub 'https://${DomRestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/reviews/analyze/{analysisId}' # GET URL.
+  RestApiId: # 배포 확인용 REST API ID.
+    Value: !Ref DomRestApi # REST API ID.
+  FunctionNames: # 배포 후 다섯 함수의 진입점과 역할을 검사할 때 사용한다.
+    Value: !Join [',', [!Ref SubmitFunction, !Ref FetchFunction, !Ref PreprocessFunction, !Ref AnalyzeFunction, !Ref CombineFunction]] # 쉼표로 구분한 함수 이름.
+  TableName: # AWS 콘솔에서 데이터 확인 시 사용할 이름.
+    Value: !Ref trustlensTable # 생성된 테이블 이름.

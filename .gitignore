@@ -1,0 +1,31 @@
+# SAM이 만드는 빌드 결과와 캐시
+.aws-sam/
+
+# 이 PC에만 설치하는 도구와 Python 가상환경
+.tools/
+.venv/
+venv/
+
+# Python 실행 중 생성되는 캐시
+__pycache__/
+*.py[cod]
+
+# 로컬 환경변수 파일. 값이 비어 있는 공유 예시 파일은 허용
+.env
+.env.*
+!.env.example
+
+# sam local --env-vars로 전달할 개인 환경변수 파일
+/env.json
+/env.local.json
+/back/env.json
+/back/env.local.json
+
+# 개인 배포 설정. 공용 samconfig.toml은 Git에 포함
+samconfig.local.toml
+samconfig.local.yaml
+samconfig.local.yml
+
+# 임시 작업 파일
+/tmp/
+/back/tmp/

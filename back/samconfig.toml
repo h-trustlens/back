@@ -1,0 +1,8 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "trustlens"
+region = "ap-northeast-2"
+resolve_s3 = false # CloudShell에서 준비한 버킷을 --s3-bucket으로 전달한다.
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true # 수동 배포에서는 변경을 확인한다. Actions는 명시적으로 확인을 생략한다.

@@ -1,0 +1,2 @@
+# CloudShell과 Ubuntu에서 실행하는 스크립트는 LF 줄바꿈을 유지한다.
+*.sh text eol=lf

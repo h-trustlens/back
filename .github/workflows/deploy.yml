@@ -1,0 +1,111 @@
+name: Deploy TrustLens
+
+on:
+  push:
+    branches: [main] # 직접 push와 PR 머지 모두 main push로 배포한다.
+    paths:
+      - 'back/lambda/**' # Lambda 코드·라이브러리 변경.
+      - 'back/template.yaml' # DynamoDB·API Gateway·Lambda 인프라 설정 변경.
+  pull_request:
+    branches: [main] # PR에서는 검증만 수행한다.
+    paths:
+      - 'back/lambda/**'
+      - 'back/template.yaml'
+  workflow_dispatch: # AWS 최초 설정 후 수동으로 실행할 수도 있다.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trustlens-${{ github.ref }}
+  cancel-in-progress: false # 진행 중인 CloudFormation 배포를 중단하지 않는다.
+
+env:
+  AWS_REGION: ap-northeast-2
+  SAM_STACK_NAME: trustlens
+  SAM_CLI_TELEMETRY: '0'
+
+defaults:
+  run:
+    working-directory: back # SAM·스크립트·테스트 명령은 back에서 실행한다.
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+      - name: Test deployment checks
+        run: |
+          python -m pip install -r requirements-ci.txt
+          python -m unittest discover -s tests -p 'test_*.py' -v
+          bash -n scripts/bootstrap-github-aws.sh
+      - name: Validate and build SAM
+        run: |
+          sam validate --lint --template-file template.yaml
+          sam build --template-file template.yaml
+
+  deploy:
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC로 임시 AWS 자격 증명을 받는다.
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_ARTIFACTS_BUCKET: ${{ vars.AWS_ARTIFACTS_BUCKET }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check AWS setup
+        run: |
+          test -n "$AWS_ROLE_ARN" || { echo '::error::Run back/scripts/bootstrap-github-aws.sh in CloudShell and set repository variable AWS_ROLE_ARN'; exit 1; }
+          test -n "$AWS_ARTIFACTS_BUCKET" || { echo '::error::Set repository variable AWS_ARTIFACTS_BUCKET from the bootstrap output'; exit 1; }
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+      - uses: aws-actions/configure-aws-credentials@4a1596c86fd706dc0521e32f0121ad1a6d1adb74 # v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: trustlens-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          retry-max-attempts: 3
+      - name: Build and deploy trustlens
+        run: |
+          sam build --template-file template.yaml
+          sam deploy --template-file .aws-sam/build/template.yaml \
+            --config-file "$PWD/samconfig.toml" --stack-name "$SAM_STACK_NAME" \
+            --s3-bucket "$AWS_ARTIFACTS_BUCKET" --s3-prefix "$SAM_STACK_NAME" \
+            --no-confirm-changeset --no-fail-on-empty-changeset
+      - name: Export deployed endpoints
+        id: outputs
+        run: |
+          mkdir -p tmp
+          aws cloudformation describe-stacks --stack-name "$SAM_STACK_NAME" \
+            --query 'Stacks[0].Outputs' --output json > tmp/stack-outputs.json
+          python - <<'PY'
+          import json, os
+          values = {item['OutputKey']: item['OutputValue'] for item in json.load(open('tmp/stack-outputs.json'))}
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('### TrustLens endpoints\n\n')
+              for key in ['SubmitUrl', 'ResultUrl', 'TableName', 'FunctionNames']:
+                  summary.write(f"- {key}: `{values[key]}`\n")
+              summary.write('\nLambda bodies are placeholders (HTTP 501). Each stored item needs expiresAt for TTL.\n')
+          PY
+      - name: Save deployment outputs
+        if: ${{ !cancelled() && steps.outputs.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: trustlens-outputs
+          path: back/tmp/stack-outputs.json # Actions의 path는 저장소 루트 기준이다.
+          retention-days: 7
+      - name: Verify deployed infrastructure
+        run: |
+          python -m pip install -r requirements-ci.txt
+          python scripts/smoke_deploy.py --outputs tmp/stack-outputs.json --region "$AWS_REGION"
