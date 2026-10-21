@@ -1,0 +1,72 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence",
+    "exceptions"
+  ],
+  "properties": {
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "card",
+          "sentence",
+          "fits",
+          "side"
+        ],
+        "properties": {
+          "card": {
+            "type": "string",
+            "pattern": "^C\\d+$"
+          },
+          "sentence": {
+            "type": "string",
+            "pattern": "^R\\d+\\.\\d+$"
+          },
+          "fits": {
+            "type": "boolean"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "positive",
+              "negative",
+              "mixed"
+            ]
+          }
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "review_id",
+          "product_sentences",
+          "irony"
+        ],
+        "properties": {
+          "review_id": {
+            "type": "string",
+            "pattern": "^R\\d+$"
+          },
+          "product_sentences": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^R\\d+\\.\\d+$"
+            }
+          },
+          "irony": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}
