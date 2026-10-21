@@ -17,6 +17,12 @@ Globals: # 다섯 Lambda에 공통으로 적용한다.
       Variables: # 실제 생성된 테이블 이름.
         TABLE_NAME: !Ref trustlensTable # 실제 생성된 테이블 이름을 전달한다.
         RETENTION_DAYS: '30' # 한 달을 30일로 정의. 저장 코드가 expiresAt 계산에 사용한다.
+        REQUEST_BUCKET: !Ref RequestBucket # 접수한 리뷰 원문(최대 10만 자)을 분석 작업자에게 넘기는 버킷.
+        ANALYZE_FUNCTION: !Sub '${AWS::StackName}-analyze' # submit이 비동기로 부르는 분석 작업자.
+        DAILY_QUOTA: '10' # 클라이언트(설치 ID)별 하루 분석 횟수. 실패·시간 초과는 되돌려 준다.
+        TIMEOUT_SECONDS: '600' # 접수 후 이 시간이 지나면 fetch가 TIMEOUT으로 판정한다(스펙 9분 + 여유).
+        MODEL_ID: global.anthropic.claude-haiku-4-5-20251001-v1:0 # 서울 리전에서 쓸 수 있는 Haiku 4.5 교차 리전 프로파일.
+        VERIFY_MODEL: global.anthropic.claude-sonnet-4-5-20250929-v1:0 # 근거·예외 검증 한 번. Haiku 3표보다 안정적이었다(06_분석실험 NOTES v6).
 
 Resources: # REST API 하나, Lambda 다섯 개, 공통 역할 하나, DB 하나.
   DomRestApi: # REST API를 생성한다.
@@ -41,6 +47,17 @@ Resources: # REST API 하나, Lambda 다섯 개, 공통 역할 하나, DB 하나
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole' # 실행 로그.
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonDynamoDBFullAccess' # DynamoDB 전체 접근.
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonBedrockFullAccess' # 모델 미정 상태의 Bedrock 전체 접근.
+      Policies: # 프로토타입에서 추가한 최소 권한.
+        - PolicyName: request-bucket-and-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow # 리뷰 원문 저장·읽기.
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub '${RequestBucket.Arn}/requests/*'
+              - Effect: Allow # submit이 analyze를 비동기 호출.
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-analyze'
 
   SubmitFunction: # POST 접수 담당 Lambda를 생성한다.
     Type: AWS::Serverless::Function # POST 담당 Lambda.
@@ -81,8 +98,12 @@ Resources: # REST API 하나, Lambda 다섯 개, 공통 역할 하나, DB 하나
     Type: AWS::Serverless::Function # API에 연결하지 않는다.
     Properties: # 이름과 코드 위치.
       FunctionName: !Sub '${AWS::StackName}-analyze' # trustlens-analyze.
-      CodeUri: lambda/analyze/ # 분석 담당 코드 폴더.
+      CodeUri: lambda/analyze/ # 분석 담당 코드 폴더. 06_분석실험 코드를 scripts/sync_analysis.sh로 복사해 넣는다.
       Role: !GetAtt LambdaExecutionRole.Arn # 동일한 전체 접근 역할.
+      Timeout: 600 # map 병렬 + reduce + 검증. Bedrock 실측값은 README 참고.
+      MemorySize: 512 # 리뷰 500건 색인과 병렬 호출.
+      EventInvokeConfig: # 비동기 호출 실패 시 자동 재시도하지 않는다(재시도·PARTIAL은 코드가 처리).
+        MaximumRetryAttempts: 0
 
   CombineFunction: # 결과 결합용으로 준비만 한다.
     Type: AWS::Serverless::Function # API에 연결하지 않는다.
@@ -90,6 +111,21 @@ Resources: # REST API 하나, Lambda 다섯 개, 공통 역할 하나, DB 하나
       FunctionName: !Sub '${AWS::StackName}-combine' # trustlens-combine.
       CodeUri: lambda/combine/ # 결합 담당 코드 폴더.
       Role: !GetAtt LambdaExecutionRole.Arn # 동일한 전체 접근 역할.
+
+  RequestBucket: # 접수한 리뷰 원문 보관. 하루 뒤 자동 삭제.
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-requests
+            Status: Enabled
+            Prefix: requests/
+            ExpirationInDays: 1
 
   trustlensTable: # 요청 하나당 항목 하나를 저장한다.
     Type: AWS::DynamoDB::Table # DynamoDB 테이블 생성.
