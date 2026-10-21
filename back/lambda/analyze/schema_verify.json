@@ -3,7 +3,8 @@
   "additionalProperties": false,
   "required": [
     "evidence",
-    "exceptions"
+    "exceptions",
+    "cards"
   ],
   "properties": {
     "evidence": {
@@ -63,6 +64,30 @@
             }
           },
           "irony": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "cards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "card",
+          "statement_ok",
+          "conditions_ok"
+        ],
+        "properties": {
+          "card": {
+            "type": "string",
+            "pattern": "^C\\d+$"
+          },
+          "statement_ok": {
+            "type": "boolean"
+          },
+          "conditions_ok": {
             "type": "boolean"
           }
         }

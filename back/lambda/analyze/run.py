@@ -196,7 +196,7 @@ def candidates(g, points, by_rid):
     return ordered[:MAX_CANDIDATES], owner
 
 
-def assemble(raw, points, index, problems, flagged=frozenset(), verdicts=None):
+def assemble(raw, points, index, problems, flagged=frozenset(), verdicts=None, card_verdicts=None):
     """Spec table 8 shape. support_count = distinct reviews across member points.
 
     Quotes come from candidates(). With verdicts (from the verify call) a quote must fit the card and sit on
@@ -272,6 +272,16 @@ def assemble(raw, points, index, problems, flagged=frozenset(), verdicts=None):
         members, count, evidence = pick(card, section, g)
         if not members:
             continue
+        cv = (card_verdicts or {}).get(card, {})
+        if cv and not cv["statement_ok"]:
+            # An overreaching summary ("3~6개월 후 고장이 많다" from one review, persona P2 round 4) falls back to
+            # the largest member opinion's own sentence, which map wrote from a single batch of reviews.
+            core = max(members, key=lambda m: len(points[m]["reviews"]))
+            problems.append(f"{card} {section} {title}: summary overreaches, replaced by member {core}")
+            g = {**g, ("text" if section == "key_opinions" else "statement"): points[core]["statement"]}
+        if cv and not cv["conditions_ok"] and g.get("conditions"):
+            problems.append(f"{card} {section} {title}: conditions contradict quotes, dropped")
+            g = {**g, "conditions": []}
         if verdicts is not None and not evidence:
             problems.append(f"{card} {section} {title}: no quote fits, dropped")
             continue
@@ -300,7 +310,8 @@ def build_verify_message(product, raw, points, index, exceptions):
     for card, section, g in cards(raw):
         kind = {"pros": "pro", "cons": "con", "key_opinions": "key"}[section]
         stance = g.get("stance") or EXPECTED_SIDE[section]
-        lines.append(f"\n{card} [{kind}/{stance}] {g.get('aspect') or '-'} | {g.get('statement') or g.get('text')}")
+        cond = f" | 조건: {', '.join(g['conditions'])}" if g.get("conditions") else ""
+        lines.append(f"\n{card} [{kind}/{stance}] {g.get('aspect') or '-'} | {g.get('statement') or g.get('text')}{cond}")
         for sid in candidates(g, points, by_rid)[0]:
             lines.append(f"  {sid} \"{sentence(sid, by_rid)}\"")
     lines += ["", "예외 리뷰 목록:"]
@@ -380,7 +391,8 @@ def finish(data, index, points, reduce_raw, verify_raw, exceptions, problems):
     verdicts = None
     if verify_raw is not None:
         verdicts = {(v["card"], v["sentence"]): v for v in verify_raw["evidence"]}
-    analysis = assemble(reduce_raw, points, index, problems, flagged, verdicts)
+    card_verdicts = {v["card"]: v for v in (verify_raw or {}).get("cards", [])}
+    analysis = assemble(reduce_raw, points, index, problems, flagged, verdicts, card_verdicts)
     by_rid = {item["rid"]: item["review"]["review_id"] for item in index}
     analysis["exceptions"] = [{**e, "review_id": by_rid[e["review_id"]]} for e in exceptions]
     sponsored = sum(r["excluded"].get("sponsored", 0) for r in data.get("collection", {}).get("by_rating", []))
@@ -538,8 +550,22 @@ def verify(product, reduce_raw, points, index, exceptions, call, model, verify_m
     with ThreadPoolExecutor(len(tasks)) as pool:
         outs = list(pool.map(lambda job: call(prompt, job[1], schema, verify_model or model, temperature=job[2]), tasks))
     card_votes = [o["structured_output"]["evidence"] for (kind, _, _), o in zip(tasks, outs) if kind == "cards"]
+    statement_votes = [o["structured_output"].get("cards", []) for (kind, _, _), o in zip(tasks, outs) if kind == "cards"]
     ex_votes = [o["structured_output"]["exceptions"] for (kind, _, _), o in zip(tasks, outs) if kind == "exceptions"]
-    return {"evidence": vote_evidence(card_votes), "exceptions": vote_exceptions(ex_votes)}, outs
+    return {"evidence": vote_evidence(card_votes), "cards": vote_cards(statement_votes),
+            "exceptions": vote_exceptions(ex_votes)}, outs
+
+
+def vote_cards(votes):
+    """A card's statement or conditions are replaced only when most votes say they overreach."""
+    need = len(votes) // 2 + 1
+    tally = {}
+    for vote in votes:
+        for v in vote:
+            t = tally.setdefault(v["card"], [0, 0])
+            t[0] += not v["statement_ok"]
+            t[1] += not v["conditions_ok"]
+    return [{"card": c, "statement_ok": bad_s < need, "conditions_ok": bad_c < need} for c, (bad_s, bad_c) in tally.items()]
 
 
 def vote_evidence(votes):
@@ -767,6 +793,10 @@ def selftest():
     key = out["key_opinions"][0]
     assert [(e["review_id"], e["stance"]) for e in key["evidence"]] == [("a", "positive"), ("d", "negative")], key
     assert "C2 pros x: no quote fits, dropped" in problems, problems
+    over = {**reduce_raw, "pros": [{**reduce_raw["pros"][0], "statement": "몇 달 뒤 대부분 조용해진다", "conditions": ["야간"]}] + reduce_raw["pros"][1:]}
+    out = assemble(over, points, index, [], card_verdicts={"C1": {"statement_ok": False, "conditions_ok": False}})
+    noise = next(r for r in out["pros"] if r["aspect"] == "소음")
+    assert noise["statement"] == "조용" and noise["conditions"] == [], noise
     data["reviews"].append({"review_id": "f", "rating": 1, "body": "좋아요 라고 썼었는데 수정합니다. 고장났어요"})
     data["reviews"].append({"review_id": "g", "rating": 1, "body": "박스가 찢겨 왔어요. 버튼도 안 눌려요"})
     data["reviews"].append({"review_id": "h", "rating": 1, "body": "박스파손 제품기스"})
