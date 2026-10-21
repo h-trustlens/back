@@ -22,6 +22,7 @@ Globals: # 다섯 Lambda에 공통으로 적용한다.
         DAILY_QUOTA: '10' # 클라이언트(설치 ID)별 하루 분석 횟수. 실패·시간 초과는 되돌려 준다.
         TIMEOUT_SECONDS: '600' # 접수 후 이 시간이 지나면 fetch가 TIMEOUT으로 판정한다(스펙 9분 + 여유).
         MODEL_ID: global.anthropic.claude-haiku-4-5-20251001-v1:0 # 서울 리전에서 쓸 수 있는 Haiku 4.5 교차 리전 프로파일.
+        VERIFY_MODEL: global.anthropic.claude-sonnet-4-5-20250929-v1:0 # 근거·예외 검증 한 번. Haiku 3표보다 안정적이었다(06_분석실험 NOTES v6).
 
 Resources: # REST API 하나, Lambda 다섯 개, 공통 역할 하나, DB 하나.
   DomRestApi: # REST API를 생성한다.

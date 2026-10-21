@@ -2,7 +2,7 @@
 
 Runs the v5 pipeline from 06_분석실험 (map -> reduce -> verify -> rule signals and grade). The analysis code
 (run.py, grade.py, prompts, schemas) is copied in by scripts/sync_analysis.sh; do not edit those copies here.
-Model failure: one retry, then a rules-only PARTIAL result (spec 6.2.1). Other failures: FAILED, quota refunded.
+Model failure: one retry, then a rules-only PARTIAL result (spec 6.2.1), quota refunded. Other failures: FAILED, quota refunded.
 """
 import json
 import os
@@ -16,6 +16,7 @@ TABLE = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
 S3 = boto3.client("s3")
 MODEL_ID = os.environ["MODEL_ID"]
 PARALLEL = int(os.environ.get("MAP_PARALLEL", "8"))
+VERIFY_MODEL = os.environ.get("VERIFY_MODEL") or None  # one stronger verify vote; unset = three Haiku votes
 
 
 def refund(job):
@@ -63,13 +64,14 @@ def lambda_handler(event, context):
     record, status = None, "DONE"
     for attempt in (1, 2):
         try:
-            record = run.pipeline(doc, run.call_bedrock, MODEL_ID, PARALLEL, log=print)
+            record = run.pipeline(doc, run.call_bedrock, MODEL_ID, PARALLEL, log=print, verify_model=VERIFY_MODEL)
             break
         except Exception as e:  # noqa: BLE001 - model or parsing failure: retry once, then rules only
             print(f"attempt {attempt} failed: {type(e).__name__}: {e}")
             why = f"{type(e).__name__}: {str(e)[:200]}"
     if record is None:
         record, status = run.rules_only(doc, why), "PARTIAL"
+        refund(job)  # no AI summary: do not use up one of the day's analyses; the user can retry for free
     timing = {"seconds": round(time.time() - started, 1), "map_seconds": record.get("map_seconds"),
               "call_seconds": record.get("call_seconds"), "stop_reasons": record.get("stop_reasons"),
               "input_tokens": record.get("input_tokens"), "output_tokens": record.get("output_tokens")}

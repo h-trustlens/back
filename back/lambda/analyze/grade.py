@@ -22,7 +22,27 @@ R2_MAX_CHARS = 60        # labelled R2 cases were short defect notes under a hig
 DEFECT = re.compile(r"기스|흠집|스크래치|불량|고장|더블\s?클릭|안\s?됨|안\s?돼요|안\s?되요|빠짐|빠졌|파손|얼룩|재포장|반품|환불|최악|비추|쓰레기|후회|실망")
 PRAISE = re.compile(r"강추|최고|만족|추천|좋아요|좋습니다|좋네요|좋은|괜찮|편해|편하|예뻐|이뻐|짱|굿")
 
-LEVEL_WORD = {"HIGH": "믿을 만함", "MEDIUM": "보통", "LOW": "주의", "INSUFFICIENT": "판단하기 어려움"}
+# "믿을 만함" read as "사도 된다" in the second persona round (P3), so the label names what is judged.
+LEVEL_WORD = {"HIGH": "조작 의심 적음", "MEDIUM": "조작 의심 보통", "LOW": "조작 의심 많음", "INSUFFICIENT": "판단하기 어려움"}
+
+
+def skew_note(index, title):
+    """참고 line when 5-star reviews are far longer than 1~2-star ones and mostly repeat a product-name word.
+    Present in all five sample products (2026-10-21), so it is shown as a caution, not used for the grade."""
+    hi = [it["review"]["body"] for it in index if it["review"].get("rating") == 5]
+    lo = [it["review"]["body"] for it in index if it["review"].get("rating") in (1, 2)]
+    if len(hi) < 5 or len(lo) < 5:
+        return None
+    ratio = sorted(map(len, hi))[len(hi) // 2] / max(sorted(map(len, lo))[len(lo) // 2], 1)
+    words = set(re.findall(r"[A-Za-z0-9가-힣]{3,}", title or ""))
+    if not words or ratio < 3:
+        return None
+    word, gap, share = max(((w, sum(w in b for b in hi) / len(hi) - sum(w in b for b in lo) / len(lo),
+                             sum(w in b for b in hi) / len(hi)) for w in words), key=lambda x: x[1])
+    if gap < 0.5:
+        return None
+    return (f"참고: 5점 리뷰는 1~2점 리뷰보다 보통 {ratio:.0f}배 길고, 열에 {round(share * 10)}건이 상품명 단어(「{word}」)를 그대로 넣어 썼어요. "
+            "홍보 글에서 흔한 모습이라 장점은 조심해서 보세요.")
 
 
 def plain(text):
@@ -78,7 +98,7 @@ def review_level(codes, exception_type):
     return "HIGH"
 
 
-def combine(index, signals, exceptions, sponsored, reward_count):
+def combine(index, signals, exceptions, sponsored, reward_count, title=""):
     """Spec table 8 `reliability`. exceptions: [{review_id: 'R<n>', type}] in harness IDs."""
     ex = {e["review_id"]: e["type"] for e in exceptions}
     by_rid = {it["rid"]: it["review"]["review_id"] for it in index}
@@ -107,12 +127,16 @@ def combine(index, signals, exceptions, sponsored, reward_count):
         if unrelated:
             found.append(f"상품과 관계없는 리뷰 {unrelated}건")
         parts.append((", ".join(found) + "이 있어요." if found else "복사한 듯 같은 글이나 상품과 관계없는 리뷰는 없었어요."))
-        parts.append("이런 리뷰가 열에 한 건 이상이면 '보통', 열에 세 건 이상이면 '주의'로 봐요.")
-    if sponsored:
-        parts.append(f"협찬·체험단 표시가 있는 리뷰 {sponsored}건은 처음부터 분석에서 뺐어요.")
+        parts.append("이런 리뷰가 열에 한 건 이상이면 '조작 의심 보통', 열에 세 건 이상이면 '조작 의심 많음'으로 봐요.")
+        parts.append("이 판단은 복사한 듯 같은 글과 상품과 관계없는 글이 얼마나 되는지만 봐요. 홍보 글처럼 보이는 리뷰를 모두 잡아내지는 못해요.")
+    parts.append(f"협찬·체험단 표시가 있는 리뷰 {sponsored}건은 처음부터 분석에서 뺐어요." if sponsored
+                 else "협찬·체험단 표시가 있는 리뷰는 없었어요.")
     if reward_count:
         parts.append(f"리뷰를 쓰면 보상을 준다는 언급이 {reward_count}건 있어요. 좋은 리뷰가 부풀려졌을 수 있어요.")
 
+    note = skew_note(index, title)
+    if note:
+        parts.append(note)
     reviews = [{"review_id": by_rid[rid], "level": lv,
                 "codes": sorted(signals.get(rid, set()) | ({f"AI_{ex[rid].upper()}"} if rid in ex else set()))}
                for rid, lv in levels.items() if lv != "HIGH"]
@@ -134,17 +158,25 @@ def coverage(data, index):
         excluded.update({k: v for k, v in r["excluded"].items() if v and isinstance(v, int)})
     failed = data.get("collection", {}).get("failed_ratings") or []
     lim = []
-    totals = [(r["rating"], r["total"]) for r in by if r.get("total") is not None]
-    if totals:  # the denominator, when the collector could read it from the rating filter
-        lim.append("쿠팡에 올라온 리뷰: " + ", ".join(f"{k}점 {v:,}건" for k, v in totals)
-                   + ". 이 중 별점마다 최대 100건을 읽었어요.")
+    rows = []  # one line per rating: Coupang total (when known) -> read -> analysed, with what was dropped
+    for r in by:
+        ex = {k: v for k, v in r["excluded"].items() if isinstance(v, int)}
+        read = r["collected"] + sum(ex.values())
+        why = ", ".join(f"{label} {ex[k]}" for k, label in (("sponsored", "협찬"), ("empty", "내용 없음"),
+                                                            ("duplicate", "중복"), ("over_limit", "글자 수 상한")) if ex.get(k))
+        total = f"쿠팡 {r['total']:,}건 중 " if r.get("total") is not None else ""
+        rows.append(f"{r['rating']}점 {total}{read}건 읽고 {r['collected']}건 분석" + (f"(뺀 것: {why})" if why else ""))
+    if rows:
+        lim.append("별점별 범위: " + " / ".join(rows) + ".")
     if excluded["over_limit"]:
-        per = ", ".join(f"{r['rating']}점 {r['collected']}건" for r in by)
-        lim.append(f"글자 수 합계 상한 때문에 별점마다 비슷한 수만 남기고 {excluded['over_limit']}건은 분석하지 않았어요({per}). "
-                   "그래서 별점별 리뷰 비율은 쿠팡 실제 비율과 달라요.")
+        lim.append(f"리뷰 글자 수 합계 상한(10만 자) 때문에 {excluded['over_limit']}건은 읽고도 분석하지 않았어요. "
+                   "별점마다 비슷한 수를 남겼기 때문에 별점별 리뷰 비율은 쿠팡 실제 비율과 달라요. "
+                   "단점 건수가 실제보다 크게 보일 수 있어요.")
     dropped = [f"{label} {excluded[k]}건" for k, label in EXCLUDED if excluded[k]]
     if dropped:
         lim.append("분석에서 뺀 리뷰: " + ", ".join(dropped) + ". 빼기만 했고 가짜라고 판정한 것은 아니에요.")
+    if not excluded["sponsored"]:
+        lim.append("협찬·체험단 표시가 있는 리뷰는 없었어요.")
     dates = defaultdict(list)
     for it in index:
         r = it["review"]

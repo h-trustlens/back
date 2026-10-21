@@ -110,7 +110,7 @@ def lambda_handler(event, context):
     latest = TABLE.get_item(Key={"recordId": f"latest#{client}#{product_id}"}).get("Item")
     if latest and not doc.get("force") and now - int(latest["createdAt"]) < REUSE_HOURS * 3600:
         job = TABLE.get_item(Key={"recordId": latest["analysisId"]}).get("Item") or {}
-        if job.get("status") in ("DONE", "PARTIAL"):
+        if job.get("status") == "DONE":  # a PARTIAL (rules-only) result is retried, not reused
             return reply(200, {"analysisId": latest["analysisId"], "status": job["status"], "reused": True,
                                "quota_remaining": remaining(client), "poll_after_seconds": 0, "estimated_seconds": 0})
 

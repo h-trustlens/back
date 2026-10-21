@@ -158,6 +158,13 @@ def guard_aspect(aspect, members, points):
 
 
 SECTIONS = ("pros", "cons", "key_opinions")
+# Shipping-only text is not evidence about the product (persona round 1; came back in round 3 runs).
+PACKAGING = re.compile(r"박스|상자|완충[재제]|뽁뽁|택배|봉투|에어캡|포장|배송")
+ITEM_WORDS = re.compile(r"재포장|중고|사용\s?흔적|반품|반송|정품|짝퉁|가품|시리얼|기스|스크래치|흠집|불량|고장|먼지|손때|개봉|뜯은|뜯겨|구성품")
+
+
+def shipping_only(text):
+    return bool(PACKAGING.search(text)) and not ITEM_WORDS.search(text)
 EXPECTED_SIDE = {"pros": "positive", "cons": "negative"}
 MAX_CANDIDATES = 6  # quotes per card sent to the verify call; keeps that call small
 MAX_QUOTE = 150
@@ -222,6 +229,10 @@ def assemble(raw, points, index, problems, flagged=frozenset(), verdicts=None):
                 else:
                     problems.append(f"{card} {section} evidence {sid}: {'not verified' if not v else 'does not fit'}, dropped")
             cands = ok
+        if section != "pros":
+            dropped = [sid for sid in cands if shipping_only(sentence(sid, by_rid))]
+            problems.extend(f"{card} {section} evidence {sid}: shipping only, dropped" for sid in dropped)
+            cands = [sid for sid in cands if sid not in dropped]
         fresh = [sid for sid in cands if sid.partition(".")[0] not in used]
         fresh.sort(key=lambda sid: sid.partition(".")[0] in flagged)
         pool = fresh or cands[:1]
@@ -248,6 +259,9 @@ def assemble(raw, points, index, problems, flagged=frozenset(), verdicts=None):
     for card, section, g in cards(raw):
         members = [m for m in g["members"] if m in points]
         title = guard_aspect(g.get("aspect") or g.get("text", ""), members, points) if members else g.get("aspect")
+        if section != "pros" and title and shipping_only(f"{title} {g.get('statement') or g.get('text') or ''}"):
+            problems.append(f"{card} {section} {title}: about shipping, not the product, dropped")
+            continue
         if section == "key_opinions":
             if any(set(g["members"]) <= grp for grp in groups):
                 problems.append(f"{card} key_opinions {title}: repeats one pros/cons group, dropped")
@@ -308,6 +322,12 @@ EDITED = re.compile(r"수정\s*(?:합니다|해요|함|했|할게)|\(수정\)|�
 PRODUCT_STATE = re.compile(r"기스|흠집|스크래치|스크라치|사용\s?흔적|사용감|중고|재포장|짝퉁|가품|찍힘|얼룩|손때")
 
 
+# Breakdown words. In a 1~2-star review they describe this item failing; 5-star reviews use them for the old
+# item that was replaced, so the rule is limited to low ratings (no false hits among 64 past low-rated flags).
+FAILURE = re.compile(r"작동\s?(?:이|을|도)?\s?(?:안|않|꺼|멈|불량)|만\s?작동|꺼져|꺼짐|고장|접촉\s?불량|불량품|연결이?\s?안|"
+                     r"클릭\s?(?:조차|이|도)?\s?안|충전이?\s?안|안\s?켜|구성품|끊기|끊겨|끊김|부품이?\s?(?:빠|없)|파손")
+
+
 def check_exceptions(exceptions, index, verify_raw, problems):
     """Drop an unrelated flag when the verifier names product sentences of that review, and an irony flag
     when the review says it was edited or the verifier says it is not irony."""
@@ -321,12 +341,15 @@ def check_exceptions(exceptions, index, verify_raw, problems):
                    if s.partition(".")[0] == rid and 1 <= int(s.partition(".")[2]) <= len(item["sentences"])]
         if e["type"] == "irony" and EDITED.search(item["review"]["body"]):
             problems.append(f"exception {rid}: edited review, not irony")
-        elif e["type"] == "irony" and v and not v["irony"]:
-            problems.append(f"exception {rid}: verifier says not irony")
+        elif e["type"] == "irony" and not (v and v["irony"]):
+            # All four irony flags in the second persona round were plain complaints (294927829 "에이 별로야").
+            problems.append(f"exception {rid}: verifier did not confirm irony")
         elif e["type"] == "unrelated" and product:
             problems.append(f"exception {rid}: has product sentences {product}, not unrelated")
         elif e["type"] == "unrelated" and PRODUCT_STATE.search(item["review"]["body"]):
             problems.append(f"exception {rid}: describes the item's condition, not unrelated")
+        elif e["type"] == "unrelated" and (item["review"].get("rating") or 5) <= 2 and FAILURE.search(item["review"]["body"]):
+            problems.append(f"exception {rid}: low rating describing a failure, not unrelated")
         else:
             kept.append(e)
     return kept
@@ -362,13 +385,13 @@ def finish(data, index, points, reduce_raw, verify_raw, exceptions, problems):
     analysis["exceptions"] = [{**e, "review_id": by_rid[e["review_id"]]} for e in exceptions]
     sponsored = sum(r["excluded"].get("sponsored", 0) for r in data.get("collection", {}).get("by_rating", []))
     reward = reward_signal(index)
-    analysis["reliability"] = grade.combine(index, signals, exceptions, sponsored, reward["count"])
+    analysis["reliability"] = grade.combine(index, signals, exceptions, sponsored, reward["count"], data.get("product", {}).get("title", ""))
     analysis["reliability"]["signals"]["reward_mention"] = reward
     analysis["coverage"], analysis["limitations"] = grade.coverage(data, index)
     return analysis
 
 
-def call_claude(system_prompt, user_message, schema, model):
+def call_claude(system_prompt, user_message, schema, model, temperature=None):  # temperature: Bedrock only
     cmd = [
         "claude", "-p",
         "--model", model,
@@ -406,7 +429,8 @@ def coerce(value, schema):
                 except ValueError:
                     # Seen on Bedrock: every remaining key written inside the first one's string,
                     # '[...], "cons": [...], "key_opinions": [...]'. Wrapping it back recovers all keys.
-                    for text in (v, re.sub(r'"(\w+)">\s*(?=[\[{])', r'"\1": ', v)):  # also seen: "cons">[ for "cons": [
+                    fixed = re.sub(r'"(\w+)">\s*(?=[\[{])', r'"\1": ', v)  # also seen: "cons">[ for "cons": [
+                    for text in (v, fixed, fixed.rstrip().removesuffix("}")):  # and the object's own closing brace inside
                         try:
                             out.update(json.loads(f'{{"{k}": {text}}}'))
                             break
@@ -443,7 +467,7 @@ def schema_gaps(value, schema, path="$"):
 BEDROCK_ATTEMPTS = 3
 
 
-def call_bedrock(system_prompt, user_message, schema, model, attempt=1):
+def call_bedrock(system_prompt, user_message, schema, model, attempt=1, temperature=0):
     """Same contract as call_claude() over Bedrock Converse (temperature 0, forced tool for structured output).
     Used by the analyze Lambda and by --bedrock. Converse does not enforce the tool schema, so the input is
     repaired (coerce) and checked (schema_gaps), with up to BEDROCK_ATTEMPTS tries for bad output or
@@ -458,7 +482,7 @@ def call_bedrock(system_prompt, user_message, schema, model, attempt=1):
             system=[{"text": system_prompt}],
             messages=[{"role": "user", "content": [{"text": user_message}]}],
             # A retry at temperature 0 repeats the same broken output, so later tries sample a little.
-            inferenceConfig={"maxTokens": BEDROCK_MAX_TOKENS, "temperature": 0 if attempt == 1 else 0.3},
+            inferenceConfig={"maxTokens": BEDROCK_MAX_TOKENS, "temperature": temperature if attempt == 1 else max(temperature, 0.3)},
             toolConfig={"tools": [{"toolSpec": {"name": "result", "inputSchema": {"json": schema}}}],
                         "toolChoice": {"tool": {"name": "result"}}},
         )
@@ -468,7 +492,7 @@ def call_bedrock(system_prompt, user_message, schema, model, attempt=1):
                              "InternalServerException") or "use case details" in str(e)  # access still propagating
         if transient and attempt < BEDROCK_ATTEMPTS:
             time.sleep(5 * attempt)
-            return call_bedrock(system_prompt, user_message, schema, model, attempt + 1)
+            return call_bedrock(system_prompt, user_message, schema, model, attempt + 1, temperature)
         raise
     blocks = [coerce(c["toolUse"]["input"], schema) for c in resp["output"]["message"]["content"] if "toolUse" in c]
     missing = schema_gaps(blocks[0], schema) if blocks else ["no tool call"]
@@ -476,9 +500,12 @@ def call_bedrock(system_prompt, user_message, schema, model, attempt=1):
         Path(os.environ["TRUSTLENS_DEBUG_DIR"], f"bad-{time.time():.0f}.json").write_text(
             json.dumps(resp["output"]["message"]["content"], ensure_ascii=False)[:200000], encoding="utf-8")
     if missing:
-        # Converse does not enforce the tool schema; v5 on Bedrock got inputs without "points" or "cons".
+        # Converse does not enforce the tool schema; v5 on Bedrock got inputs without "points" or "cons",
+        # and a reduce call that returned only "pros" three times. The retry names what was missing.
         if attempt < BEDROCK_ATTEMPTS:
-            return call_bedrock(system_prompt, user_message, schema, model, attempt + 1)
+            keys = ", ".join(schema.get("required", []))
+            reminder = f"\n\n(다시 요청: 앞선 출력에서 {'; '.join(missing[:3])}. 최상위 키 {keys}를 모두 채운 하나의 JSON으로 답한다.)"
+            return call_bedrock(system_prompt, user_message.split("\n\n(다시 요청:")[0] + reminder, schema, model, attempt + 1, temperature)
         raise RuntimeError(f"bedrock output does not match schema after {attempt} tries: {missing[:3]} (stopReason={resp.get('stopReason')})")
     usage = resp.get("usage", {})
     return {"structured_output": blocks[0], "usage": {"output_tokens": usage.get("outputTokens"), "input_tokens": usage.get("inputTokens")},
@@ -494,22 +521,50 @@ def load(name):
     return json.loads(text) if name.endswith(".json") else text
 
 
-def verify(product, reduce_raw, points, index, exceptions, call, model):
-    """Two verify calls at once: card quotes, and exception reviews on their own. Asked together, Bedrock
-    Haiku kept missing product sentences in exception reviews (706123624, 733969350, 2026-10-21)."""
+VOTES = (0, 0.4, 0.4)  # verify temperatures; a single verify pass flipped between runs (2026-10-21 round 3)
+
+
+def verify(product, reduce_raw, points, index, exceptions, call, model, verify_model=None):
+    """Card quotes and exception reviews are checked in separate calls (asked together, Bedrock Haiku missed
+    product sentences in exception reviews), each by three votes at once; a verdict needs two of three."""
     empty = {"pros": [], "cons": [], "key_opinions": []}
-    jobs = [build_verify_message(product, reduce_raw, points, index, [])]
+    jobs = [("cards", build_verify_message(product, reduce_raw, points, index, []))]
     if exceptions:
-        jobs.append(build_verify_message(product, empty, points, index, exceptions))
+        jobs.append(("exceptions", build_verify_message(product, empty, points, index, exceptions)))
     prompt, schema = load("prompt_verify.md"), load("schema_verify.json")
-    with ThreadPoolExecutor(len(jobs)) as pool:
-        outs = list(pool.map(lambda msg: call(prompt, msg, schema, model), jobs))
-    raw = {"evidence": outs[0]["structured_output"]["evidence"],
-           "exceptions": outs[1]["structured_output"]["exceptions"] if exceptions else []}
-    return raw, outs
+    # A stronger verify model needs one vote: Sonnet 4.5 caught the contrast-clause quote Haiku passed 2 of 3 times.
+    votes = (0,) if verify_model else VOTES
+    tasks = [(kind, msg, t) for kind, msg in jobs for t in votes]
+    with ThreadPoolExecutor(len(tasks)) as pool:
+        outs = list(pool.map(lambda job: call(prompt, job[1], schema, verify_model or model, temperature=job[2]), tasks))
+    card_votes = [o["structured_output"]["evidence"] for (kind, _, _), o in zip(tasks, outs) if kind == "cards"]
+    ex_votes = [o["structured_output"]["exceptions"] for (kind, _, _), o in zip(tasks, outs) if kind == "exceptions"]
+    return {"evidence": vote_evidence(card_votes), "exceptions": vote_exceptions(ex_votes)}, outs
 
 
-def pipeline(data, call, model, parallel=PARALLEL, log=lambda msg: print(msg, file=sys.stderr)):
+def vote_evidence(votes):
+    tally = {}
+    for vote in votes:
+        for v in vote:
+            tally.setdefault((v["card"], v["sentence"]), []).append(v)
+    need = len(votes) // 2 + 1
+    return [{"card": c, "sentence": sid, "fits": sum(x["fits"] for x in vs) >= need,
+             "side": Counter(x["side"] for x in vs).most_common(1)[0][0]} for (c, sid), vs in tally.items()]
+
+
+def vote_exceptions(votes):
+    need = len(votes) // 2 + 1
+    merged = {}
+    for vote in votes:
+        for v in vote:
+            m = merged.setdefault(v["review_id"], {"sentences": Counter(), "irony": 0})
+            m["sentences"].update(set(v["product_sentences"]))
+            m["irony"] += bool(v["irony"])
+    return [{"review_id": rid, "product_sentences": [s for s, n in m["sentences"].items() if n >= need],
+             "irony": m["irony"] >= need} for rid, m in merged.items()]
+
+
+def pipeline(data, call, model, parallel=PARALLEL, log=lambda msg: print(msg, file=sys.stderr), verify_model=None):
     """map -> reduce -> verify -> code steps for one Review Schema 1.1 document. Shared by the CLI and the
     analyze Lambda (08_프로토타입/back), so both run exactly this code. Returns the result record."""
     product = data.get("product", {})
@@ -530,7 +585,7 @@ def pipeline(data, call, model, parallel=PARALLEL, log=lambda msg: print(msg, fi
 
     reduce_out = call(load("prompt_reduce.md"), build_reduce_message(product, points, index), load("schema_reduce.json"), model)
     reduce_raw = reduce_out["structured_output"]
-    verify_raw, verify_outs = verify(product, reduce_raw, points, index, exceptions, call, model)
+    verify_raw, verify_outs = verify(product, reduce_raw, points, index, exceptions, call, model, verify_model)
     analysis = finish(data, index, points, reduce_raw, verify_raw, exceptions, problems)
 
     outs = map_outs + [reduce_out] + verify_outs
@@ -562,7 +617,7 @@ def rules_only(data, why):
     sponsored = sum(r["excluded"].get("sponsored", 0) for r in data.get("collection", {}).get("by_rating", []))
     reward = reward_signal(index)
     analysis = {"pros": [], "cons": [], "key_opinions": [], "exceptions": []}
-    analysis["reliability"] = grade.combine(index, signals, [], sponsored, reward["count"])
+    analysis["reliability"] = grade.combine(index, signals, [], sponsored, reward["count"], data.get("product", {}).get("title", ""))
     analysis["reliability"]["signals"]["reward_mention"] = reward
     analysis["coverage"], analysis["limitations"] = grade.coverage(data, index)
     analysis["limitations"].insert(0, "AI 요약이 실패해서 장점·단점·핵심 의견 없이 규칙으로 센 결과만 보여 드려요. "
@@ -575,7 +630,8 @@ def main():
     ap.add_argument("reviews", nargs="?")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--parallel", type=int, default=PARALLEL, help="map calls at once; lower it when memory is short")
-    ap.add_argument("--bedrock", metavar="MODEL_ID", help="call Bedrock Converse instead of Claude Code, e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    ap.add_argument("--bedrock", metavar="MODEL_ID", help="call Bedrock Converse instead of Claude Code, e.g. global.anthropic.claude-haiku-4-5-20251001-v1:0")
+    ap.add_argument("--verify-model", metavar="MODEL_ID", help="one verify vote with this model instead of three with --bedrock's")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--reverify", metavar="RESULT_JSON", help="rerun only the verify call and code steps on a saved result")
     ap.add_argument("--rebuild", metavar="RESULT_JSON", help="rerun only the code steps (no model calls) on a saved result")
@@ -591,7 +647,7 @@ def main():
         ap.error("reviews.json is required")
 
     data = json.loads(Path(args.reviews).read_text(encoding="utf-8"))
-    record = {"input": str(Path(args.reviews).resolve()), **pipeline(data, call_claude, args.model, args.parallel)}
+    record = {"input": str(Path(args.reviews).resolve()), **pipeline(data, call_claude, args.model, args.parallel, verify_model=args.verify_model)}
     analysis, problems = record["analysis"], record["verify_problems"]
     results = HERE / "results"
     results.mkdir(exist_ok=True)
@@ -744,9 +800,11 @@ def selftest():
     two = {"type": "object", "properties": {"pros": {"type": "array"}, "cons": {"type": "array"}}}
     assert coerce({"pros": '[1], "cons": [2]'}, two) == {"pros": [1], "cons": [2]}
     assert coerce({"pros": '[1],\n"cons">[2]'}, two) == {"pros": [1], "cons": [2]}
+    assert coerce({"pros": '[1], "cons": [2]\n}'}, two) == {"pros": [1], "cons": [2]}
     cov, lim = grade.coverage({"collection": {"by_rating": [{"rating": 5, "status": "OK", "collected": 1, "total": 1234,
                                "excluded": {"sponsored": 1}, "sponsored": [{"review_id": "z", "snippet": "체험단"}]}]}}, index)
-    assert lim[0].startswith("쿠팡에 올라온 리뷰: 5점 1,234건") and cov["by_rating"][0]["sponsored"][0]["review_id"] == "z", (lim, cov)
+    assert lim[0] == "별점별 범위: 5점 쿠팡 1,234건 중 2건 읽고 1건 분석(뺀 것: 협찬 1)." and cov["by_rating"][0]["sponsored"][0]["review_id"] == "z", (lim, cov)
+    assert shipping_only("박스가 찢겨서 왔어요") and not shipping_only("박스는 멀쩡한데 본체에 기스") and not shipping_only("소음이 커요")
     print("selftest OK")
 
 if __name__ == "__main__":
