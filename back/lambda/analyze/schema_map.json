@@ -1,0 +1,102 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "points",
+    "exceptions"
+  ],
+  "properties": {
+    "points": {
+      "type": "array",
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "aspect",
+          "statement",
+          "stance",
+          "conditions",
+          "reviews",
+          "evidence"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "pro",
+              "con",
+              "opinion"
+            ]
+          },
+          "aspect": {
+            "type": "string"
+          },
+          "statement": {
+            "type": "string"
+          },
+          "stance": {
+            "type": "string",
+            "enum": [
+              "positive",
+              "negative",
+              "mixed"
+            ]
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reviews": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^R\\d+$"
+            }
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "pattern": "^R\\d+\\.\\d+$"
+            }
+          }
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "review_id",
+          "type",
+          "reason"
+        ],
+        "properties": {
+          "review_id": {
+            "type": "string",
+            "pattern": "^R\\d+$"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "irony",
+              "unrelated"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
