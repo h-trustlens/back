@@ -94,6 +94,10 @@ policy = {
                          f"arn:aws:dynamodb:{region}:{account}:table/trustlens-reviews/*"],
         },
         {
+            "Sid": "ManageRequestBucket", "Effect": "Allow", "Action": "s3:*",
+            "Resource": ["arn:aws:s3:::trustlens-requestbucket-*", "arn:aws:s3:::trustlens-requestbucket-*/*"],
+        },
+        {
             "Sid": "ManageRestApi", "Effect": "Allow",
             "Action": ["apigateway:GET", "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE"],
             "Resource": [f"arn:aws:apigateway:{region}::/restapis*",
