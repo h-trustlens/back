@@ -151,7 +151,10 @@ EXCLUDED = (("sponsored", "협찬·체험단 표시"), ("empty", "내용 없는 
 
 
 def coverage(data, index):
-    """Spec table 8 `coverage` and plain-language `limitations` from the collection record."""
+    """Spec table 8 `coverage` and plain-language `limitations` from the collection record.
+
+    Failed ratings may still have usable reviews; count those in the analysis instead of dropping them.
+    """
     by = sorted(data.get("collection", {}).get("by_rating", []), key=lambda r: -r["rating"])
     excluded = Counter()
     for r in by:
@@ -189,8 +192,13 @@ def coverage(data, index):
     no_date = sum(1 for it in index if not it["review"].get("written_at"))
     if no_rating or no_date:
         lim.append(f"별점이 없는 리뷰 {no_rating}건, 작성일이 없는 리뷰 {no_date}건이 있어요.")
-    if failed:
-        lim.append(f"{', '.join(f'{x}점' for x in failed)} 리뷰는 가져오지 못해 빠졌어요.")
+    analyzed_by_rating = Counter(it["review"].get("rating") for it in index)
+    for rating in failed:
+        count = analyzed_by_rating[rating]
+        if count:
+            lim.append(f"{rating}점 리뷰는 수집을 끝내지 못했지만 확보한 {count}건은 분석에 포함했어요.")
+        else:
+            lim.append(f"{rating}점 리뷰는 수집하지 못해 분석에 포함하지 못했어요.")
     if len(index) < 30:
         lim.append(f"분석한 리뷰가 {len(index)}건뿐이라 결과가 치우칠 수 있어요.")
     cov = {"received": sum(r["collected"] + sum(r["excluded"].values()) for r in by),

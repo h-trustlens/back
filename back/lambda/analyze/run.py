@@ -61,7 +61,10 @@ def split_sentences(body):
 
 
 def build_index(data):
-    """Short IDs for the whole request: R<n> -> original review, R<n>.<k> -> sentence text."""
+    """Short IDs for the whole request: R<n> -> original review, R<n>.<k> -> sentence text.
+
+    Keep reviews collected before a rating failed; failed_ratings marks incomplete collection, not exclusion.
+    """
     reviews = []
     for n, r in enumerate(data["reviews"], 1):
         reviews.append({"rid": f"R{n}", "review": r, "sentences": split_sentences(r["body"])})

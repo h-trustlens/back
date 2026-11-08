@@ -53,6 +53,7 @@ main 대상 PR을 올리는 단계에서는 검증만 진행된다. README 등 �
   - 응답: `202 {analysisId, status, quota_remaining, poll_after_seconds, estimated_seconds}`
   - 같은 클라이언트가 24시간 안에 같은 상품을 다시 보내면 `200 {reused: true}`로 지난 결과를 돌려주고 횟수를 쓰지 않는다.
   - 오류: `400 INVALID_REQUEST`, `429 QUOTA_EXCEEDED`(하루 10회, KST 0시에 초기화)
+  - `collection.failed_ratings`는 해당 별점의 수집을 끝내지 못했다는 뜻이다. 실패 전에 확보해 `reviews`에 넣은 리뷰도 분석한다. `limitations`에는 일부 리뷰를 분석한 경우와 한 건도 없는 경우를 나눠 안내한다.
 - **GET `/v1/reviews/analyze/{analysisId}`**
   - 응답: `{status, result?, quota_remaining, elapsed_seconds, estimated_seconds, timing?}`
   - status는 `PENDING`, `RUNNING`, `DONE`, `PARTIAL`, `FAILED`, `TIMEOUT` 중 하나다.
